@@ -65,140 +65,94 @@
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
     <script>
-        const supabaseUrl = 'https://qncndyybqqssksyzgbhb.supabase.co';
-        const supabaseKey = 'sb_publishable_iW4u2LAvXS-NV7YOhHuk7w_DRBW0aih';
-        
-        // Dummy storage object to guarantee localStorage is NEVER touched for Auth
-        const dummyStorage = {
-            getItem: () => null,
-            setItem: () => {},
-            removeItem: () => {}
-        };
-
-        const supabaseClient = supabase.createClient(supabaseUrl, supabaseKey, {
-            auth: {
-                persistSession: false,
-                storage: dummyStorage 
-            }
-        });
-
-        window.state = {
-            currentUser: null,
-            users: [],
-            tasks: [],
-            loading: true,
-            currentView: '' // 'login', 'admin', 'user'
-        };
-
+        const supabaseUrl = "https://lwykphwaleeknwuapiwa.supabase.co";
+        const supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx3eWtwaHdhbGVla253dWFwaXdhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMxMDUxMTcsImV4cCI6MjEwODY4MTExN30.-aZ_3pQDq8p0V1Ahtqe2zCtkWtN3cj4WZ59kkwoLhjM";
+        const supabaseClient = supabase.createClient(supabaseUrl, supabaseKey);
+        window.state = { currentUser:null, users:[], tasks:[], loading:true, currentView:'' };
         const appContainer = document.getElementById('app');
-
-        function setHTML(el, html) {
-            if (!el) return;
-            if (el.innerHTML !== html) {
-                el.innerHTML = html;
-            }
+        let changeChannel=null, loadGeneration=0, refreshTimer=null;
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
         }
-
+        function setHTML(el, html) { if(el && el.innerHTML!==html) el.innerHTML=html; }
+        async function internalEmail(username) {
+            const hash=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(username.trim().toLowerCase()));
+            return Array.from(new Uint8Array(hash),x=>x.toString(16).padStart(2,'0')).join('')+'@dailywork.invalid';
+        }
+        function notifyFailure(error) { alert(error?.message || 'The request failed. Please retry.'); }
         async function loadData() {
+            const generation=++loadGeneration;
             try {
-                // Fetch Users
-                const { data: usersData, error: usersErr } = await supabaseClient.from('users').select('*');
-                if (usersErr) throw usersErr;
-                
-                window.state.users = usersData || [];
-
-                // Initialize default admin if DB users table is completely empty
-                if (window.state.users.length === 0) {
-                    const defaultAdmin = { id: 'admin-id', username: 'admin', password: 'admin123', role: 'admin' };
-                    await supabaseClient.from('users').insert([defaultAdmin]);
-                    window.state.users.push(defaultAdmin);
+                const {data:{session},error:sessionError}=await supabaseClient.auth.getSession();
+                if(sessionError) throw sessionError;
+                if(!session) {
+                    if(changeChannel) { await supabaseClient.removeChannel(changeChannel); changeChannel=null; }
+                    window.state.currentUser=null; window.state.users=[]; window.state.tasks=[];
+                    finishLoading(); return;
                 }
-
-                // Check for persisted login to prevent login screen flicker on refresh
-                const savedUserId = localStorage.getItem('dw_user_id');
-                if (savedUserId) {
-                    const u = window.state.users.find(x => x.id === savedUserId);
-                    if (u) window.state.currentUser = u;
-                }
-
-                // Fetch Tasks
-                const { data: tasksData, error: tasksErr } = await supabaseClient.from('tasks').select('*');
-                if (tasksErr) throw tasksErr;
-                
-                window.state.tasks = tasksData || [];
-
-                setupRealtimeListeners();
-                finishLoading();
-
-            } catch (err) {
-                console.error("Supabase load error:", err);
-                finishLoading();
+                const [{data:users,error:usersError},{data:tasks,error:tasksError}]=await Promise.all([
+                    supabaseClient.from('dw_profiles').select('id,auth_user_id,username,role').order('username'),
+                    supabaseClient.from('dw_tasks').select('*').order('id')
+                ]);
+                if(usersError || tasksError) throw usersError || tasksError;
+                if(generation!==loadGeneration) return;
+                const current=(users||[]).find(x=>x.auth_user_id===session.user.id);
+                if(!current) throw new Error('Your account is not available. Please contact the administrator.');
+                window.state.currentUser=current; window.state.users=users||[]; window.state.tasks=tasks||[];
+                setupRealtimeListeners(); finishLoading();
+            } catch(error) {
+                if(generation!==loadGeneration) return;
+                window.state.currentUser=null; window.state.users=[]; window.state.tasks=[];
+                finishLoading(); notifyFailure(error);
             }
         }
-
+        function queueRefresh() {
+            clearTimeout(refreshTimer); refreshTimer=setTimeout(()=>loadData(),100);
+        }
         function setupRealtimeListeners() {
-            supabaseClient
-                .channel('public-changes')
-                .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, async () => {
-                    const { data } = await supabaseClient.from('users').select('*');
-                    if (data) {
-                        window.state.users = data;
-                        route();
-                    }
-                })
-                .on('postgres_changes', { event: '*', schema: 'public', table: 'tasks' }, async () => {
-                    const { data } = await supabaseClient.from('tasks').select('*');
-                    if (data) {
-                        window.state.tasks = data;
-                        route();
-                    }
-                })
+            if(changeChannel) return;
+            changeChannel=supabaseClient.channel('daily-work-authenticated')
+                .on('postgres_changes',{event:'*',schema:'public',table:'dw_profiles'},queueRefresh)
+                .on('postgres_changes',{event:'*',schema:'public',table:'dw_tasks'},queueRefresh)
                 .subscribe();
         }
-
-        function finishLoading() {
-            if (window.state.loading) {
-                window.state.loading = false;
-                route();
-            }
+        function finishLoading() { window.state.loading=false; route(); }
+        async function mutation(operation) {
+            try { await operation(); await loadData(); }
+            catch(error) { await loadData(); notifyFailure(error); throw error; }
         }
-
-        window.dbActions = {
-            async addUser(userObj) {
-                window.state.users.push(userObj);
-                route(); 
-                await supabaseClient.from('users').insert([userObj]);
-            },
-            async updatePassword(userId, newPassword) {
-                const u = window.state.users.find(u => u.id === userId);
-                if(u) u.password = newPassword;
-                route(); 
-                await supabaseClient.from('users').update({ password: newPassword }).eq('id', userId);
-            },
-            async deleteUser(userId) {
-                window.state.tasks = window.state.tasks.filter(t => t.assigneeId !== userId);
-                window.state.users = window.state.users.filter(u => u.id !== userId);
-                route(); 
-                await supabaseClient.from('tasks').delete().eq('assigneeId', userId);
-                await supabaseClient.from('users').delete().eq('id', userId);
-            },
-            async addTask(taskObj) {
-                window.state.tasks.push(taskObj);
-                route(); 
-                await supabaseClient.from('tasks').insert([taskObj]);
-            },
-            async updateTask(taskObj) {
-                const idx = window.state.tasks.findIndex(t => t.id === taskObj.id);
-                if (idx > -1) window.state.tasks[idx] = taskObj;
-                route(); 
-                await supabaseClient.from('tasks').update(taskObj).eq('id', taskObj.id);
-            },
-            async deleteTask(taskId) {
-                window.state.tasks = window.state.tasks.filter(t => t.id !== taskId);
-                route(); 
-                await supabaseClient.from('tasks').delete().eq('id', taskId);
+        async function adminAction(body) {
+            const {data,error}=await supabaseClient.functions.invoke('daily-work-admin',{body});
+            if(error) {
+                let detail=null;
+                try { detail=await error.context?.json(); } catch(_) {}
+                throw new Error(detail?.error || 'The administrator request failed.');
             }
+            if(!data?.ok) throw new Error(data?.error || 'The administrator request failed.');
+        }
+        window.dbActions = {
+            addUser: user=>mutation(()=>adminAction({action:'create',username:user.username,password:user.password})),
+            updatePassword: (id,password)=>mutation(()=>adminAction({action:'reset-password',userId:id,password})),
+            deleteUser: id=>mutation(()=>adminAction({action:'delete',userId:id})),
+            addTask: task=>mutation(async()=>{
+                const {error}=await supabaseClient.rpc('dw_save_task',{p_task:task,p_expected_version:null});
+                if(error) throw error;
+            }),
+            updateTask: task=>mutation(async()=>{
+                const {error}=await supabaseClient.rpc('dw_save_task',{p_task:task,p_expected_version:task.version});
+                if(error) throw error;
+            }),
+            deleteTask: id=>mutation(async()=>{
+                const {error}=await supabaseClient.rpc('dw_delete_task',{p_task_id:id});
+                if(error) throw error;
+            })
         };
+        supabaseClient.auth.onAuthStateChange((event)=>{
+            if(event==='SIGNED_OUT' || event==='SIGNED_IN' || event==='TOKEN_REFRESHED') queueRefresh();
+        });
+        // Never trust the legacy unsigned user-ID as authentication.
+        localStorage.removeItem('dw_user_id');
+        window.addEventListener('focus',queueRefresh);
 
         const getLocalYYYYMMDD = (d) => {
             const offset = d.getTimezoneOffset() * 60000;
@@ -337,8 +291,8 @@
                     <div class="hidden sm:flex items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-full border border-slate-100">
                         <div class="text-primary">${getSvgUser()}</div>
                         <span class="text-sm font-medium text-slate-700">
-                            ${window.state.currentUser.username} 
-                            <span class="text-xs text-slate-400 font-normal ml-1">(${window.state.currentUser.role})</span>
+                            ${escapeHtml(window.state.currentUser.username)} 
+                            <span class="text-xs text-slate-400 font-normal ml-1">(${escapeHtml(window.state.currentUser.role)})</span>
                         </span>
                     </div>
                     <div class="h-6 w-px bg-slate-200 hidden sm:block"></div>
@@ -366,7 +320,7 @@
                             <form id="create-user-form" class="space-y-3">
                                 <input type="text" id="new-username" required placeholder="New Username" class="w-full px-3 py-2 text-sm rounded border border-slate-300 focus:ring-1 focus:ring-primary outline-none">
                                 <div class="relative">
-                                    <input type="password" id="new-password" required placeholder="Password" class="w-full pl-3 pr-8 py-2 text-sm rounded border border-slate-300 focus:ring-1 focus:ring-primary outline-none">
+                                    <input type="password" id="new-password" required minlength="8" autocomplete="new-password" placeholder="Password (8+ characters)" class="w-full pl-3 pr-8 py-2 text-sm rounded border border-slate-300 focus:ring-1 focus:ring-primary outline-none">
                                     <button type="button" class="toggle-password absolute right-2 top-2 text-slate-400 hover:text-slate-600 focus:outline-none">
                                         ${getSvgEye()}
                                     </button>
@@ -374,7 +328,7 @@
                                 <button type="submit" class="w-full bg-slate-800 hover:bg-slate-900 text-white text-sm font-medium py-2 rounded transition-colors shadow-sm">Create User</button>
                             </form>
                         </div>
-                        <div id="admin-user-list" class="max-h-60 overflow-y-auto bg-slate-50"></div>
+                        <p class="px-4 py-2 text-xs text-slate-500">Existing passwords are private. Enter a new password in a team member's field to reset it.</p><div id="admin-user-list" class="max-h-60 overflow-y-auto bg-slate-50"></div>
                     </div>
                     <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
                         <div class="border-b border-slate-100 bg-slate-50 p-4">
@@ -519,14 +473,14 @@
                 <div class="flex items-center justify-between p-3 border-b border-slate-100 last:border-0 hover:bg-slate-100 transition-colors group">
                     <span class="font-medium text-sm text-slate-700 flex items-center gap-2">
                         <span class="text-slate-400">${getSvgUser()}</span>
-                        ${u.username}
+                        ${escapeHtml(u.username)}
                     </span>
                     <div class="flex items-center gap-2">
                         <div class="relative w-28">
-                            <input type="password" data-action="edit-password" data-id="${u.id}" value="${u.password}" class="w-full pl-2 pr-6 py-1 text-xs border border-slate-300 rounded focus:ring-1 focus:ring-primary outline-none" title="Change password (auto-saves on click away)">
+                            <input type="password" data-action="edit-password" data-id="${escapeHtml(u.id)}" value="" placeholder="New password" minlength="8" autocomplete="new-password" class="w-full pl-2 pr-6 py-1 text-xs border border-slate-300 rounded focus:ring-1 focus:ring-primary outline-none" title="Reset password (minimum 8 characters; saves when you leave the field)">
                             <button type="button" class="toggle-password absolute right-1.5 top-1 text-slate-400 hover:text-slate-600 focus:outline-none">${getSvgEye()}</button>
                         </div>
-                        <button type="button" data-action="delete-user" data-id="${u.id}" class="text-slate-400 hover:text-red-500 p-1 rounded hover:bg-red-50 transition-colors" title="Delete User">
+                        <button type="button" data-action="delete-user" data-id="${escapeHtml(u.id)}" class="text-slate-400 hover:text-red-500 p-1 rounded hover:bg-red-50 transition-colors" title="Delete User">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
                         </button>
                     </div>
@@ -544,7 +498,7 @@
                 } else {
                     assigneeHtml = `
                         <select id="task-assignee" required class="w-full px-3 py-2 text-sm rounded border border-slate-300 focus:ring-1 focus:ring-primary outline-none bg-white">
-                            ${standardUsers.map(u => `<option value="${u.id}">${u.username}</option>`).join('')}
+                            ${standardUsers.map(u => `<option value="${escapeHtml(u.id)}">${escapeHtml(u.username)}</option>`).join('')}
                         </select>
                     `;
                     document.getElementById('submit-task-btn').disabled = false;
@@ -592,18 +546,18 @@
                 <div class="text-xs py-2 border-b border-slate-100 last:border-0 ${c.isLog ? 'bg-slate-100 -mx-2 px-2 rounded my-1' : ''}">
                     <div class="flex justify-between items-baseline mb-0.5">
                         <span class="font-semibold text-slate-700 flex items-center gap-1.5">
-                            ${c.author}
-                            ${c.isLog ? `<span class="bg-slate-200 text-slate-600 text-[9px] uppercase font-bold px-1 py-0.5 rounded border border-slate-300">Log: ${c.logDate}</span>` : ''}
+                            ${escapeHtml(c.author)}
+                            ${c.isLog ? `<span class="bg-slate-200 text-slate-600 text-[9px] uppercase font-bold px-1 py-0.5 rounded border border-slate-300">Log: ${escapeHtml(c.logDate)}</span>` : ''}
                         </span>
                         <span class="text-slate-400 text-[10px] whitespace-nowrap ml-2">${formatDate(c.date)}</span>
                     </div>
-                    <p class="text-slate-600 leading-relaxed">${c.text}</p>
+                    <p class="text-slate-600 leading-relaxed">${escapeHtml(c.text)}</p>
                 </div>
             `).join('');
 
             const checkboxHtml = !isAdminView ? `
                 <div class="pt-0.5 flex-shrink-0">
-                    <button data-action="toggle-task" data-id="${task.id}" class="w-5 h-5 rounded border focus:ring-2 focus:ring-primary transition-colors flex items-center justify-center cursor-pointer ${completed ? 'bg-primary border-primary text-white hover:bg-primary-hover hover:border-primary-hover shadow-inner' : 'bg-white border-slate-400 hover:border-primary shadow-sm'}">${completed ? '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path></svg>' : ''}</button>
+                    <button data-action="toggle-task" data-id="${escapeHtml(task.id)}" class="w-5 h-5 rounded border focus:ring-2 focus:ring-primary transition-colors flex items-center justify-center cursor-pointer ${completed ? 'bg-primary border-primary text-white hover:bg-primary-hover hover:border-primary-hover shadow-inner' : 'bg-white border-slate-400 hover:border-primary shadow-sm'}">${completed ? '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path></svg>' : ''}</button>
                 </div>
             ` : '';
 
@@ -620,23 +574,23 @@
                     <div class="flex-grow min-w-0">
                         <div class="flex items-start justify-between gap-4">
                             <div class="truncate">
-                                <h3 class="text-sm font-semibold ${textClass} truncate">${task.title}</h3>
+                                <h3 class="text-sm font-semibold ${textClass} truncate">${escapeHtml(task.title)}</h3>
                                 <div class="flex items-center gap-1.5 mt-1 flex-wrap">
                                     ${isAdminView && completed ? `<span class="text-[10px] uppercase font-bold text-primary bg-primary-light px-1.5 py-0.5 rounded border border-primary-border">Completed</span>` : ''}
                                     ${isAdminView && !completed ? `<span class="text-[10px] uppercase font-bold text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">Pending</span>` : ''}
-                                    ${isAdminView ? `<span class="text-[10px] flex items-center gap-1 text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200">${getSvgUser()} ${getAssigneeName(task.assigneeId)}</span>` : ''}
+                                    ${isAdminView ? `<span class="text-[10px] flex items-center gap-1 text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200">${getSvgUser()} ${escapeHtml(getAssigneeName(task.assigneeId))}</span>` : ''}
                                     ${task.createdBy === 'admin-id' && !isAdminView ? `<span class="text-[10px] uppercase font-bold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200">Assigned by Admin</span>` : ''}
                                     ${task.createdBy === window.state.currentUser.id && !isAdminView ? `<span class="text-[10px] uppercase font-bold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200">Personal Task</span>` : ''}
                                     ${freqBadgeHtml}
                                 </div>
                             </div>
-                            ${canDelete ? `<button data-action="delete-task" data-id="${task.id}" class="text-slate-400 hover:text-red-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0" title="Delete task"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>` : ''}
+                            ${canDelete ? `<button data-action="delete-task" data-id="${escapeHtml(task.id)}" class="text-slate-400 hover:text-red-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0" title="Delete task"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>` : ''}
                         </div>
                         <div class="mt-3 bg-slate-50 rounded p-3 border border-slate-200 shadow-inner">
                             <div class="max-h-32 overflow-y-auto pr-2 custom-scrollbar">
                                 ${commentsHtml || '<p class="text-[11px] text-slate-400 italic">No notes yet.</p>'}
                             </div>
-                            <form class="flex gap-2 mt-2" data-action="add-comment" data-id="${task.id}">
+                            <form class="flex gap-2 mt-2" data-action="add-comment" data-id="${escapeHtml(task.id)}">
                                 <input type="text" required placeholder="Add a note..." class="flex-grow px-2.5 py-1.5 text-xs rounded border border-slate-300 focus:ring-1 focus:ring-primary outline-none bg-white shadow-sm">
                                 <button type="submit" class="bg-white border border-slate-300 hover:bg-primary-light hover:text-primary-hover text-slate-700 text-xs font-medium px-3 py-1.5 rounded transition-colors shadow-sm">Post</button>
                             </form>
@@ -661,9 +615,9 @@
                         <button id="close-modal" type="button" class="text-slate-400 hover:text-slate-600 transition-colors focus:outline-none"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg></button>
                     </div>
                     <div class="p-5">
-                        <p class="text-sm text-slate-600 mb-4">Logging completion for: <br><span class="font-semibold text-slate-800">"${task.title}"</span></p>
+                        <p class="text-sm text-slate-600 mb-4">Logging completion for: <br><span class="font-semibold text-slate-800">"${escapeHtml(task.title)}"</span></p>
                         <form id="log-routine-form" class="space-y-4">
-                            <input type="hidden" id="modal-task-id" value="${task.id}">
+                            <input type="hidden" id="modal-task-id" value="${escapeHtml(task.id)}">
                             <div>
                                 <label class="block text-xs font-medium text-slate-700 mb-1">Date Completed</label>
                                 <input type="date" id="modal-date" required value="${todayStr}" max="${todayStr}" class="w-full px-3 py-2 text-sm rounded border border-slate-300 focus:ring-1 focus:ring-primary outline-none">
@@ -696,18 +650,9 @@
             if (e.target.id === 'login-form') {
                 const u = document.getElementById('login-username').value.trim();
                 const p = document.getElementById('login-password').value.trim();
-                const user = window.state.users.find(user => 
-                    user.username.toLowerCase() === u.toLowerCase() && 
-                    user.password === p
-                );
-                
-                if (user) {
-                    window.state.currentUser = user;
-                    localStorage.setItem('dw_user_id', user.id); 
-                    route();
-                } else {
-                    document.getElementById('login-error').classList.remove('hidden');
-                }
+                const {error}=await supabaseClient.auth.signInWithPassword({email:await internalEmail(u),password:p});
+                if(error) document.getElementById('login-error').classList.remove('hidden');
+                else await loadData();
             }
 
             if (e.target.id === 'create-user-form') {
@@ -775,6 +720,7 @@
             if (e.target.dataset.action === 'edit-password') {
                 const newPass = e.target.value.trim();
                 if(newPass.length > 0) {
+                    if(newPass.length < 8) { alert("Use at least 8 characters for a new password."); return; }
                     await window.dbActions.updatePassword(e.target.dataset.id, newPass);
                 }
             }
@@ -795,10 +741,9 @@
             }
 
             if (e.target.closest('#logout-btn')) {
-                window.state.currentUser = null;
-                window.state.currentView = '';
-                localStorage.removeItem('dw_user_id');
-                route();
+                await supabaseClient.auth.signOut();
+                window.state.currentView='';
+                await loadData();
                 return;
             }
 
